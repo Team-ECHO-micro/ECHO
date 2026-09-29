@@ -31,6 +31,59 @@ export interface ChatEventData {
   model?: string | null;
 }
 
+export interface Commitment {
+  text: string;
+  due_date: string;
+  overdue?: boolean;
+  days_overdue?: number;
+}
+
+export interface TimeJumpResult {
+  customer_id: string;
+  virtual_now: string;
+  days_advanced: number;
+  overdue_commitments: Commitment[];
+  total_commitments: number;
+}
+
+export interface HealthStatus {
+  status: string;
+  virtual_now: string;
+  groq_configured: boolean;
+  hindsight_configured: boolean;
+}
+
+export interface DemoResetResult {
+  reset: boolean;
+  virtual_now: string;
+  memories_forgotten: string[];
+  eval_files_removed: number;
+}
+
+export interface EvalResult {
+  ran_at: string;
+  total_scenarios: number;
+  results: Array<{
+    scenario: string;
+    memory_on: boolean;
+    reply: string;
+    sentiment: string;
+    commitments: Commitment[];
+    memories_recalled: number;
+    degraded: boolean;
+    model: string | null;
+    check_description: string;
+    elapsed_seconds: number;
+    error: string | null;
+  }>;
+  summary: {
+    memory_on_avg_memories_recalled: number;
+    memory_off_avg_memories_recalled: number;
+    scenarios_with_errors: number;
+    total_elapsed_seconds: number;
+  };
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, init);
   if (!response.ok) {
@@ -46,7 +99,8 @@ export function fetchCustomers(): Promise<Customer[]> {
 
 export function fetchBrief(customerId: string): Promise<{
   tickets: Array<{ id: string; subject: string; status: string; opened_at: string }>;
-  open_commitments: Array<{ text: string; due_date: string }>;
+  open_commitments: Commitment[];
+  overdue_commitments: Commitment[];
 }> {
   return request(`/api/customers/${customerId}/brief`);
 }
@@ -74,6 +128,49 @@ export async function fetchMemories(customerId: string): Promise<MemoryItem[]> {
 export async function forgetMemory(customerId: string): Promise<void> {
   await request(`/api/customers/${customerId}/memory`, { method: "DELETE" });
 }
+
+// ---------------------------------------------------------------------------
+// Virtual clock
+// ---------------------------------------------------------------------------
+
+export function fetchHealth(): Promise<HealthStatus> {
+  return request<HealthStatus>("/api/health");
+}
+
+export function timeJump(customerId: string, days: number): Promise<TimeJumpResult> {
+  return request<TimeJumpResult>(`/api/customers/${customerId}/time-jump`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ days }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Demo reset
+// ---------------------------------------------------------------------------
+
+export function demoReset(): Promise<DemoResetResult> {
+  return request<DemoResetResult>("/api/demo/reset", { method: "POST" });
+}
+
+// ---------------------------------------------------------------------------
+// Evaluation
+// ---------------------------------------------------------------------------
+
+export function runEvaluation(
+  scenarios?: string[],
+  memoryOn = true,
+): Promise<EvalResult> {
+  return request<EvalResult>("/api/eval/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scenarios: scenarios || null, memory_on: memoryOn }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Chat SSE
+// ---------------------------------------------------------------------------
 
 export function streamChat(
   customerId: string,
