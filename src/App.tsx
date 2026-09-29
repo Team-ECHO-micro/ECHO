@@ -2,22 +2,25 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Brain, Zap, FileText, Trash2, Send, AlertTriangle,
   CheckCircle2, XCircle, ChevronDown, ChevronUp, User, Bot, Loader2, Database, Plus, X,
+  Clock, RotateCcw, Play, FastForward, AlertCircle,
 } from "lucide-react";
 import {
   fetchCustomers, fetchBrief, seedMemory,
   fetchMemories, forgetMemory, streamChat, addCustomer,
-  type Customer, type MemoryItem,
+  fetchHealth, timeJump, demoReset, runEvaluation,
+  type Customer, type MemoryItem, type Commitment, type TimeJumpResult,
+  type HealthStatus, type EvalResult,
 } from "@/lib/api";
 
 interface Message {
   role: "customer" | "agent";
   text: string;
   sentiment?: string;
-  commitments?: any[];
+  commitments?: Commitment[];
   issueType?: string | null;
   fixApplied?: string | null;
   outcome?: string | null;
-  memories?: any[];
+  memories?: Array<{ memory_id: string; text: string; score: number; source: string }>;
   degraded?: boolean;
   model?: string | null;
   followup?: boolean;
@@ -68,6 +71,7 @@ function App() {
   const [memoryOn, setMemoryOn] = useState(true);
   const [showTransparency, setShowTransparency] = useState(true);
   const [showBrief, setShowBrief] = useState(false);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [brief, setBrief] = useState<any>(null);
   const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [seeding, setSeeding] = useState(false);
@@ -77,11 +81,26 @@ function App() {
   const [newCustomer, setNewCustomer] = useState({ name: "", company: "", plan: "Starter", email: "", integrations: "" });
   const [followupPending, setFollowupPending] = useState(false);
 
+  // Virtual clock state
+  const [virtualNow, setVirtualNow] = useState<string>("");
+  const [jumpDays, setJumpDays] = useState(7);
+  const [jumping, setJumping] = useState(false);
+  const [overdueCommitments, setOverdueCommitments] = useState<Commitment[]>([]);
+
+  // Demo reset state
+  const [resetting, setResetting] = useState(false);
+
+  // Eval state
+  const [showEval, setShowEval] = useState(false);
+  const [evalRunning, setEvalRunning] = useState(false);
+  const [evalResult, setEvalResult] = useState<EvalResult | null>(null);
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     fetchCustomers().then(setCustomers).catch((e) => setError(e.message));
+    fetchHealth().then((h: HealthStatus) => setVirtualNow(h.virtual_now)).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -99,6 +118,7 @@ function App() {
     setBrief(null);
     setShowBrief(false);
     setSeedStatus(null);
+    setOverdueCommitments([]);
     try {
       const mems = await fetchMemories(customer.id);
       setMemories(mems);
@@ -123,7 +143,7 @@ function App() {
       selectedCustomer.id,
       text,
       memoryOn,
-      new Date().toISOString(),
+      virtualNow || new Date().toISOString(),
       (event, data) => {
         if (event === "token") {
           setMessages((prev) => {
@@ -136,7 +156,7 @@ function App() {
           setMessages((prev) => {
             const next = [...prev];
             const last = next[next.length - 1];
-            if (last && last.streaming) last.memories = data.memories;
+            if (last && last.streaming) last.memories = data.memories as Message["memories"];
             return next;
           });
         } else if (event === "degraded") {
@@ -148,11 +168,11 @@ function App() {
             if (last && last.streaming) {
               last.text = data.reply ?? "";
               last.sentiment = data.sentiment;
-              last.commitments = data.commitments;
+              last.commitments = data.commitments as Commitment[] | undefined;
               last.issueType = data.issue_type;
               last.fixApplied = data.fix_applied;
               last.outcome = data.outcome;
-              last.memories = data.recalled_memories;
+              last.memories = data.recalled_memories as Message["memories"];
               last.degraded = data.degraded;
               last.model = data.model;
               last.streaming = false;
@@ -214,8 +234,8 @@ function App() {
       setSeedStatus(`Loaded ${count} case notes into memory`);
       const mems = await fetchMemories(selectedCustomer.id);
       setMemories(mems);
-    } catch (e: any) {
-      setSeedStatus(`Failed: ${e.message}`);
+    } catch (e: unknown) {
+      setSeedStatus(`Failed: ${e instanceof Error ? e.message : String(e)}`);
     }
     setSeeding(false);
   };
@@ -248,14 +268,72 @@ function App() {
       setShowAddCustomer(false);
       setNewCustomer({ name: "", company: "", plan: "Starter", email: "", integrations: "" });
       loadCustomerData(created);
-    } catch (e: any) {
-      setError(e.message);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
     }
   };
 
+  const handleTimeJump = async () => {
+    if (!selectedCustomer || jumping) return;
+    setJumping(true);
+    try {
+      const result: TimeJumpResult = await timeJump(selectedCustomer.id, jumpDays);
+      setVirtualNow(result.virtual_now);
+      setOverdueCommitments(result.overdue_commitments);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+    setJumping(false);
+  };
+
+  const handleDemoReset = async () => {
+    setResetting(true);
+    try {
+      const result = await demoReset();
+      setVirtualNow(result.virtual_now);
+      setOverdueCommitments([]);
+      setMessages([]);
+      setMemories([]);
+      setBrief(null);
+      setSeedStatus("Demo reset complete");
+      setEvalResult(null);
+      // Reload customers
+      const custs = await fetchCustomers();
+      setCustomers(custs);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+    setResetting(false);
+  };
+
+  const handleRunEval = async () => {
+    setEvalRunning(true);
+    try {
+      const result = await runEvaluation(undefined, memoryOn);
+      setEvalResult(result);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+    setEvalRunning(false);
+  };
+
   const formatDate = (iso: string) => {
-    const d = new Date(iso);
-    return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    try {
+      const d = new Date(iso);
+      return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    } catch {
+      return iso;
+    }
+  };
+
+  const formatDateTime = (iso: string) => {
+    try {
+      const d = new Date(iso);
+      return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) +
+        " " + d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+    } catch {
+      return iso;
+    }
   };
 
   const getInitials = (name: string) => name.split(" ").map((n) => n[0]).join("").slice(0, 2);
@@ -274,17 +352,51 @@ function App() {
               <p className="text-xs text-gray-500">Memory-first AI customer support</p>
             </div>
           </div>
-          <button
-            onClick={() => setMemoryOn(!memoryOn)}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
-              memoryOn
-                ? "bg-teal-500/15 text-teal-400 border border-teal-500/30"
-                : "bg-gray-800 text-gray-500 border border-gray-700"
-            }`}
-          >
-            <Zap className="w-4 h-4" />
-            {memoryOn ? "Memory ON" : "Memory OFF"}
-          </button>
+          <div className="flex items-center gap-3">
+            {/* Virtual clock display */}
+            {virtualNow && (
+              <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-gray-800 border border-gray-700 text-xs text-gray-400">
+                <Clock className="w-3.5 h-3.5" />
+                <span>{formatDateTime(virtualNow)}</span>
+              </div>
+            )}
+
+            {/* Demo reset */}
+            <button
+              onClick={handleDemoReset}
+              disabled={resetting}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium bg-gray-800 text-gray-400 border border-gray-700 hover:border-amber-500/30 hover:text-amber-400 transition-all disabled:opacity-50"
+            >
+              <RotateCcw className={`w-3.5 h-3.5 ${resetting ? "animate-spin" : ""}`} />
+              Reset
+            </button>
+
+            {/* Eval button */}
+            <button
+              onClick={() => setShowEval(!showEval)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
+                showEval
+                  ? "bg-purple-500/15 text-purple-400 border border-purple-500/30"
+                  : "bg-gray-800 text-gray-400 border border-gray-700 hover:border-purple-500/30 hover:text-purple-400"
+              }`}
+            >
+              <Play className="w-3.5 h-3.5" />
+              Eval
+            </button>
+
+            {/* Memory toggle */}
+            <button
+              onClick={() => setMemoryOn(!memoryOn)}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
+                memoryOn
+                  ? "bg-teal-500/15 text-teal-400 border border-teal-500/30"
+                  : "bg-gray-800 text-gray-500 border border-gray-700"
+              }`}
+            >
+              <Zap className="w-4 h-4" />
+              {memoryOn ? "Memory ON" : "Memory OFF"}
+            </button>
+          </div>
         </div>
       </header>
 
@@ -418,6 +530,55 @@ function App() {
             </div>
           )}
 
+          {/* Time Jump Control */}
+          {selectedCustomer && (
+            <div className="p-4 border-b border-gray-800">
+              <div className="flex items-center gap-2 mb-3">
+                <FastForward className="w-3.5 h-3.5 text-gray-500" />
+                <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Time Jump</h2>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min={1}
+                  max={365}
+                  value={jumpDays}
+                  onChange={(e) => setJumpDays(Math.max(1, parseInt(e.target.value) || 1))}
+                  className="w-16 bg-gray-800 text-sm text-gray-100 rounded px-2 py-1.5 border border-gray-700 focus:border-teal-500/50 focus:outline-none text-center"
+                />
+                <span className="text-xs text-gray-500">days</span>
+                <button
+                  onClick={handleTimeJump}
+                  disabled={jumping}
+                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-sm bg-amber-500/15 text-amber-400 border border-amber-500/30 hover:bg-amber-500/25 transition-all disabled:opacity-50"
+                >
+                  {jumping ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FastForward className="w-3.5 h-3.5" />}
+                  Jump
+                </button>
+              </div>
+
+              {/* Overdue commitments */}
+              {overdueCommitments.length > 0 && (
+                <div className="mt-3">
+                  <p className="text-xs font-semibold text-red-400 mb-1.5 flex items-center gap-1">
+                    <AlertCircle className="w-3 h-3" />
+                    {overdueCommitments.length} overdue commitment{overdueCommitments.length > 1 ? "s" : ""}
+                  </p>
+                  <div className="flex flex-col gap-1">
+                    {overdueCommitments.map((c, i) => (
+                      <div key={i} className="text-xs bg-red-500/10 text-red-300 border border-red-500/20 rounded px-2 py-1.5">
+                        <p className="font-medium">{c.text}</p>
+                        <p className="text-red-400/70 mt-0.5">
+                          Due {formatDate(c.due_date)} · {c.days_overdue} day{c.days_overdue !== 1 ? "s" : ""} overdue
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Brief button */}
           {selectedCustomer && (
             <div className="p-4">
@@ -434,7 +595,104 @@ function App() {
 
         {/* Main chat area */}
         <main className="flex-1 flex flex-col overflow-hidden">
-          {selectedCustomer ? (
+          {showEval ? (
+            /* Evaluation Panel */
+            <div className="flex-1 flex flex-col overflow-hidden">
+              <div className="flex-shrink-0 border-b border-gray-800 bg-[#16181f] px-6 py-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h2 className="text-base font-semibold text-white">Evaluation Harness</h2>
+                    <p className="text-xs text-gray-500">8 workflow scenarios · Memory {memoryOn ? "ON" : "OFF"}</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleRunEval}
+                      disabled={evalRunning}
+                      className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium bg-purple-500 hover:bg-purple-400 text-white transition-colors disabled:opacity-50"
+                    >
+                      {evalRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                      {evalRunning ? "Running…" : "Run All Scenarios"}
+                    </button>
+                    <button
+                      onClick={() => setShowEval(false)}
+                      className="text-gray-500 hover:text-gray-300"
+                    >
+                      <X className="w-5 h-5" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div className="flex-1 overflow-y-auto px-6 py-4">
+                {evalResult ? (
+                  <div className="max-w-4xl mx-auto">
+                    {/* Summary */}
+                    <div className="grid grid-cols-4 gap-3 mb-6">
+                      <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-800">
+                        <p className="text-xs text-gray-500 mb-1">Scenarios</p>
+                        <p className="text-2xl font-semibold text-white">{evalResult.total_scenarios}</p>
+                      </div>
+                      <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-800">
+                        <p className="text-xs text-gray-500 mb-1">Avg Memories (ON)</p>
+                        <p className="text-2xl font-semibold text-teal-400">{evalResult.summary.memory_on_avg_memories_recalled}</p>
+                      </div>
+                      <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-800">
+                        <p className="text-xs text-gray-500 mb-1">Avg Memories (OFF)</p>
+                        <p className="text-2xl font-semibold text-gray-400">{evalResult.summary.memory_off_avg_memories_recalled}</p>
+                      </div>
+                      <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-800">
+                        <p className="text-xs text-gray-500 mb-1">Elapsed</p>
+                        <p className="text-2xl font-semibold text-white">{evalResult.summary.total_elapsed_seconds}s</p>
+                      </div>
+                    </div>
+
+                    {/* Results table */}
+                    <div className="flex flex-col gap-3">
+                      {evalResult.results.map((r, i) => (
+                        <div key={i} className={`rounded-xl p-4 border ${r.error ? "bg-red-500/5 border-red-500/20" : "bg-gray-800/50 border-gray-800"}`}>
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-medium text-gray-200">{r.scenario}</span>
+                              <span className={`text-xs px-2 py-0.5 rounded ${r.memory_on ? "bg-teal-500/15 text-teal-400" : "bg-gray-700 text-gray-400"}`}>
+                                {r.memory_on ? "ON" : "OFF"}
+                              </span>
+                              {r.memories_recalled > 0 && (
+                                <span className="text-xs text-teal-400">{r.memories_recalled} memories</span>
+                              )}
+                            </div>
+                            <span className="text-xs text-gray-600">{r.elapsed_seconds}s</span>
+                          </div>
+                          {r.error ? (
+                            <p className="text-sm text-red-400">{r.error}</p>
+                          ) : (
+                            <p className="text-sm text-gray-400 line-clamp-3">{r.reply}</p>
+                          )}
+                          <p className="text-xs text-gray-600 mt-2 italic">Check: {r.check_description}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="h-full flex flex-col items-center justify-center text-center">
+                    <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-purple-400/20 to-pink-600/20 flex items-center justify-center mb-4">
+                      <Play className="w-8 h-8 text-purple-400" />
+                    </div>
+                    <h3 className="text-lg font-semibold text-gray-300 mb-1">Run Evaluation</h3>
+                    <p className="text-sm text-gray-600 max-w-md mb-4">
+                      Execute 8 scenarios to compare Memory OFF vs Memory ON. Results are saved as JSON and shown here.
+                    </p>
+                    <button
+                      onClick={handleRunEval}
+                      disabled={evalRunning}
+                      className="flex items-center gap-2 px-6 py-2.5 rounded-lg text-sm font-medium bg-purple-500 hover:bg-purple-400 text-white transition-colors disabled:opacity-50"
+                    >
+                      {evalRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                      {evalRunning ? "Running…" : "Run All Scenarios"}
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : selectedCustomer ? (
             <>
               {/* Customer context bar */}
               <div className="flex-shrink-0 border-b border-gray-800 bg-[#16181f] px-6 py-3">
@@ -447,6 +705,12 @@ function App() {
                     </p>
                   </div>
                   <div className="flex items-center gap-3">
+                    {overdueCommitments.length > 0 && (
+                      <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-red-500/10 border border-red-500/20">
+                        <AlertCircle className="w-3.5 h-3.5 text-red-400" />
+                        <span className="text-xs text-red-400">{overdueCommitments.length} overdue</span>
+                      </div>
+                    )}
                     {degraded && (
                       <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/20">
                         <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
@@ -563,7 +827,7 @@ function App() {
         </main>
 
         {/* Transparency panel */}
-        {selectedCustomer && showTransparency && (
+        {selectedCustomer && showTransparency && !showEval && (
           <aside className="w-72 flex-shrink-0 border-l border-gray-800 bg-[#16181f] flex flex-col overflow-hidden">
             <div className="p-4 border-b border-gray-800">
               <div className="flex items-center gap-2 mb-1">
@@ -583,7 +847,7 @@ function App() {
                     </div>
                   );
                 }
-                return <TransparencyContent msg={lastAgent} />;
+                return <TransparencyContent msg={lastAgent} overdueCommitments={overdueCommitments} />;
               })()}
             </div>
           </aside>
@@ -610,7 +874,7 @@ function App() {
                   <p className="text-sm text-gray-600">No tickets</p>
                 ) : (
                   <div className="flex flex-col gap-2">
-                    {brief.tickets.map((t: any) => (
+                    {brief.tickets.map((t: { id: string; subject: string; status: string; opened_at: string }) => (
                       <div key={t.id} className="bg-gray-800/50 rounded-lg p-3 border border-gray-800">
                         <div className="flex items-center justify-between mb-1">
                           <p className="text-sm text-gray-300">{t.subject}</p>
@@ -630,18 +894,47 @@ function App() {
                   <p className="text-sm text-gray-600">No open commitments</p>
                 ) : (
                   <div className="flex flex-col gap-2">
-                    {brief.open_commitments.map((c: any, i: number) => (
-                      <div key={i} className="bg-gray-800/50 rounded-lg p-3 border border-gray-800 flex items-start gap-2">
-                        <CheckCircle2 className="w-4 h-4 text-teal-400 mt-0.5 flex-shrink-0" />
+                    {brief.open_commitments.map((c: Commitment, i: number) => (
+                      <div key={i} className={`rounded-lg p-3 border flex items-start gap-2 ${
+                        c.overdue
+                          ? "bg-red-500/5 border-red-500/20"
+                          : "bg-gray-800/50 border-gray-800"
+                      }`}>
+                        {c.overdue ? (
+                          <AlertCircle className="w-4 h-4 text-red-400 mt-0.5 flex-shrink-0" />
+                        ) : (
+                          <CheckCircle2 className="w-4 h-4 text-teal-400 mt-0.5 flex-shrink-0" />
+                        )}
                         <div>
-                          <p className="text-sm text-gray-300">{c.text}</p>
-                          <p className="text-xs text-gray-600 mt-0.5">Due {formatDate(c.due_date)}</p>
+                          <p className={`text-sm ${c.overdue ? "text-red-300" : "text-gray-300"}`}>{c.text}</p>
+                          <p className={`text-xs mt-0.5 ${c.overdue ? "text-red-400/70" : "text-gray-600"}`}>
+                            Due {formatDate(c.due_date)}
+                            {c.overdue && " · OVERDUE"}
+                          </p>
                         </div>
                       </div>
                     ))}
                   </div>
                 )}
               </div>
+              {brief.overdue_commitments && brief.overdue_commitments.length > 0 && (
+                <div>
+                  <h3 className="text-xs font-semibold text-red-400 uppercase tracking-wider mb-2">⚠ Overdue</h3>
+                  <div className="flex flex-col gap-2">
+                    {brief.overdue_commitments.map((c: Commitment, i: number) => (
+                      <div key={i} className="bg-red-500/10 rounded-lg p-3 border border-red-500/20 flex items-start gap-2">
+                        <XCircle className="w-4 h-4 text-red-400 mt-0.5 flex-shrink-0" />
+                        <div>
+                          <p className="text-sm text-red-300">{c.text}</p>
+                          <p className="text-xs text-red-400/70 mt-0.5">
+                            Due {formatDate(c.due_date)} · {c.days_overdue} day{c.days_overdue !== 1 ? "s" : ""} overdue
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -704,7 +997,7 @@ function MessageBubble({ msg, showTransparency }: { msg: Message; showTransparen
 
         {isAgent && showDetails && msg.memories && (
           <div className="mt-2 bg-gray-800/50 rounded-lg p-3 border border-gray-800 flex flex-col gap-2">
-            {msg.memories.map((m: any, i: number) => (
+            {msg.memories.map((m, i: number) => (
               <div key={i} className="flex items-start gap-2">
                 <span className={`text-xs px-1.5 py-0.5 rounded ${m.source === "personal" ? "bg-teal-500/10 text-teal-400" : "bg-blue-500/10 text-blue-400"}`}>
                   {m.source}
@@ -719,14 +1012,14 @@ function MessageBubble({ msg, showTransparency }: { msg: Message; showTransparen
   );
 }
 
-function TransparencyContent({ msg }: { msg: Message }) {
+function TransparencyContent({ msg, overdueCommitments }: { msg: Message; overdueCommitments: Commitment[] }) {
   return (
     <div className="flex flex-col gap-4">
       {msg.memories && msg.memories.length > 0 ? (
         <div>
           <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Recalled memories</h3>
           <div className="flex flex-col gap-2">
-            {msg.memories.map((m: any, i: number) => (
+            {msg.memories.map((m, i: number) => (
               <div key={i} className="bg-gray-800/50 rounded-lg p-2.5 border border-gray-800">
                 <div className="flex items-center gap-2 mb-1">
                   <span className={`text-[10px] px-1.5 py-0.5 rounded ${m.source === "personal" ? "bg-teal-500/10 text-teal-400" : "bg-blue-500/10 text-blue-400"}`}>
@@ -762,13 +1055,27 @@ function TransparencyContent({ msg }: { msg: Message }) {
         <div>
           <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Commitments</h3>
           <div className="flex flex-col gap-1.5">
-            {msg.commitments.map((c: any, i: number) => (
+            {msg.commitments.map((c, i: number) => (
               <div key={i} className="text-xs text-gray-400 flex items-start gap-2">
                 <CheckCircle2 className="w-3 h-3 text-teal-400 mt-0.5 flex-shrink-0" />
                 <div>
                   <p>{c.text}</p>
                   <p className="text-[10px] text-gray-600">due {c.due_date}</p>
                 </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {overdueCommitments.length > 0 && (
+        <div>
+          <h3 className="text-xs font-semibold text-red-400 uppercase tracking-wider mb-2">Overdue Commitments</h3>
+          <div className="flex flex-col gap-1.5">
+            {overdueCommitments.map((c, i) => (
+              <div key={i} className="text-xs text-red-300 bg-red-500/10 rounded-lg px-2.5 py-2 border border-red-500/20">
+                <p className="font-medium">{c.text}</p>
+                <p className="text-red-400/70 mt-0.5">{c.days_overdue} day{c.days_overdue !== 1 ? "s" : ""} overdue</p>
               </div>
             ))}
           </div>
