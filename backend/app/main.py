@@ -1,8 +1,9 @@
 """Echo FastAPI app — API contract per section 9.
 
-Phase 2: chat SSE is now wired to the real agent loop (Groq + Hindsight).
-Customers, outcome, and forget are DB-backed. Brief, time-jump, and eval
-remain stubs for later phases.
+Phase 2+: chat SSE is wired to the real agent loop (Groq + Hindsight).
+Customers, outcome, and forget are DB-backed. Virtual clock is persisted and
+calculates overdue commitments. Evaluation harness covers 8 scenarios.
+Demo reset returns the system to a known state.
 """
 
 import json
@@ -17,10 +18,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.agent import run as agent_run
-from app.config import settings
+from app.config import settings, virtual_clock
+from app.eval import run_evaluation
 from app.memory import MemoryService
 
-app = FastAPI(title="Echo", version="0.2.0")
+app = FastAPI(title="Echo", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -150,7 +152,7 @@ class EvalRequest(BaseModel):
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "virtual_now": settings.virtual_now,
+        "virtual_now": virtual_clock.now_iso,
         "groq_configured": bool(settings.groq_api_key),
         "hindsight_configured": bool(settings.hindsight_api_key),
     }
@@ -197,7 +199,7 @@ async def add_customer(customer: CustomerCreate) -> dict[str, Any]:
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest) -> StreamingResponse:
-    now = req.now or settings.virtual_now
+    now = req.now or virtual_clock.now_iso
 
     async def stream() -> AsyncIterator[bytes]:
         yield _sse("status", {"agent": "echo", "memory_enabled": req.memory_enabled})
@@ -279,7 +281,7 @@ async def handoff_brief(customer_id: str) -> dict[str, Any]:
             "id": str(note.get("id") or len(tickets)),
             "subject": note.get("issue", "Support case"),
             "status": note.get("status", "open"),
-            "opened_at": note.get("opened_at") or settings.virtual_now,
+            "opened_at": note.get("opened_at") or virtual_clock.now_iso,
         })
         note_commitments = note.get("commitments", [])
         if isinstance(note_commitments, str) and note_commitments:
@@ -289,26 +291,67 @@ async def handoff_brief(customer_id: str) -> dict[str, Any]:
                 commitment for commitment in note_commitments if isinstance(commitment, dict)
             )
     tickets.sort(key=lambda ticket: ticket["opened_at"], reverse=True)
+
+    # Calculate overdue status for commitments
+    overdue = virtual_clock.overdue_commitments(commitments)
+    overdue_texts = {c["text"] for c in overdue}
+    for c in commitments:
+        c["overdue"] = c["text"] in overdue_texts
+
     return {
         "customer_id": customer_id,
         "summary": f"{len(tickets)} recent cases, {len(commitments)} open commitments.",
         "tickets": tickets[:5],
         "open_commitments": commitments,
+        "overdue_commitments": overdue,
     }
 
 
 # ---------------------------------------------------------------------------
-# Time-jump (virtual clock)
+# Time-jump (virtual clock) — fully wired
 # ---------------------------------------------------------------------------
 
 
+@app.get("/api/virtual-clock")
+def get_virtual_clock() -> dict[str, Any]:
+    return {"virtual_now": virtual_clock.now_iso}
+
+
 @app.post("/api/customers/{customer_id}/time-jump")
-def time_jump(customer_id: str, req: TimeJumpRequest) -> dict[str, Any]:
+async def time_jump(customer_id: str, req: TimeJumpRequest) -> dict[str, Any]:
+    new_now = virtual_clock.advance(req.days)
+
+    # Collect all open commitments for this customer and flag overdue ones
+    all_commitments: list[dict] = []
+    for note in DEMO_CASE_NOTES.get(customer_id, []):
+        note_commitments = note.get("commitments", [])
+        if isinstance(note_commitments, list):
+            all_commitments.extend(c for c in note_commitments if isinstance(c, dict))
+
+    # Also check Hindsight-stored commitments
+    try:
+        items = await memory.alist_memories(customer_id, limit=20)
+        for item in items:
+            text = item.get("text", "") if isinstance(item, dict) else getattr(item, "text", "")
+            try:
+                note = json.loads(text)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(note, dict):
+                nc = note.get("commitments", [])
+                if isinstance(nc, list):
+                    all_commitments.extend(c for c in nc if isinstance(c, dict))
+    except Exception:
+        pass
+
+    overdue = virtual_clock.overdue_commitments(all_commitments)
+
     return {
         "customer_id": customer_id,
-        "virtual_now": settings.virtual_now,
+        "virtual_now": new_now,
         "days_advanced": req.days,
-        "note": "Virtual clock advancement is wired in Phase 4.",
+        "overdue_commitments": overdue,
+        "total_commitments": len(all_commitments),
     }
 
 
@@ -342,14 +385,55 @@ async def forget_memory(customer_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Evaluation — real 8-scenario harness
 # ---------------------------------------------------------------------------
 
 
 @app.post("/api/eval/run")
-def eval_run(req: EvalRequest) -> dict[str, Any]:
+async def eval_run(req: EvalRequest) -> dict[str, Any]:
+    report = await run_evaluation(
+        scenarios=req.scenarios,
+        memory_on=req.memory_on,
+    )
     return {
-        "results": [],
-        "note": "Evaluation harness lands in Phase 6.",
-        "memory_on": req.memory_on,
+        "ran_at": report.ran_at,
+        "total_scenarios": report.total_scenarios,
+        "results": report.results,
+        "summary": report.summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Demo reset — return the system to a known starting state
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/demo/reset")
+async def demo_reset() -> dict[str, Any]:
+    """Reset virtual clock, wipe all demo customer memories, remove eval output."""
+    # Reset virtual clock
+    new_time = virtual_clock.reset()
+
+    # Wipe memory for all demo customers
+    forgotten = []
+    for customer in DEMO_CUSTOMERS:
+        try:
+            await memory.aforget(customer["id"])
+            forgotten.append(customer["id"])
+        except Exception:
+            pass
+
+    # Remove eval results
+    eval_dir = __import__("pathlib").Path("eval_results")
+    eval_cleaned = 0
+    if eval_dir.exists():
+        for f in eval_dir.glob("*.json"):
+            f.unlink()
+            eval_cleaned += 1
+
+    return {
+        "reset": True,
+        "virtual_now": new_time,
+        "memories_forgotten": forgotten,
+        "eval_files_removed": eval_cleaned,
     }
